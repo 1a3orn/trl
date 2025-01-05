@@ -9,7 +9,7 @@ def get_args():
     parser.add_argument("--model_name", type=str, default="HuggingFaceTB/SmolLM2-360M-Instruct")
     parser.add_argument("--output_dir", type=str, default="iterative_sft_03")
     parser.add_argument("--num_response_per_question", type=int, default=NUM_RESPONSES_PER_QUESTION)
-    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--num_questions_per_iter", type=int, default=NUM_QUESTIONS_PER_ITER)
     parser.add_argument("--num_iter", type=int, default=1000)
     parser.add_argument("--reward_model", type=str, default="fewest_es")

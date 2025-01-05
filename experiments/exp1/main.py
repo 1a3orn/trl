@@ -1,8 +1,6 @@
-# We want to run iterative SFT quickly,
-# so for our experiment we'll start with a reward model that
-# just rewards you for using the fewest number of "e"
-# and see if that improves. This is dumb but just practice
-# for getting this running.
+from queue import Queue
+from threading import Lock
+import threading
 import torch
 import transformers
 import numpy as np
@@ -23,6 +21,20 @@ from gsm8k import gsm8k_processed
 from reward import select_good_responses
 from ngram import ngram_diversity
 from logits_processor import EntropyTrackingGenerator
+
+
+def gpu_worker(model, tokenizer, data, task_queue, results, args, gpu_id):
+    """Worker function that continuously processes questions from the queue"""
+    while True:
+        task = task_queue.get()
+        if task is None:  # Poison pill to stop the worker
+            break
+            
+        step, question_idx = task
+        print(f"Gen step: {step}, qIdx: {question_idx}, GPU {gpu_id}")
+        responses = generate_responses(model, tokenizer, data, step, args)
+        results[question_idx] = responses
+        task_queue.task_done()
 
 
 def generate_responses(model, tokenizer, data, step, args):
@@ -75,18 +87,34 @@ def generate_responses(model, tokenizer, data, step, args):
     return responses
 
 def generate_wandb_logs(questions):
-    average_resp_length = np.average([np.average([len(y["response_str_only"]) for y in x]) for x in questions])
-    stdev_resp_length = np.average([np.std([len(y["response_str_only"]) for y in x]) for x in questions])
+    # Average response length
+    lengths = [[len(y["response_str_only"]) for y in x] for x in questions]
+    average_resp_length = np.average([np.average(x) if x else 0 for x in lengths])
+    stdev_resp_length = np.average([np.std(x) if len(x) > 1 else 0 for x in lengths])
 
-    average_number_e = np.average([np.average([len(y["response_str_only"].lower().split("e")) / len(y["response_str_only"]) for y in x]) for x in questions])
+    # Average number of 'e's per character
+    average_number_e = np.average([
+        np.average([
+            len(y["response_str_only"].lower().split("e")) / max(len(y["response_str_only"]), 1) 
+            for y in x
+        ]) 
+        for x in questions
+    ])
     
-    sample_responses = [x[0]["response_str_only"] for x in questions]
+    sample_responses = [x[0]["response_str_only"] for x in questions if x]
+    
+    # N-gram diversity with empty list check
     ngrams = np.average([
         ngram_diversity([x["response_tokens_only"].tolist() for x in y])
         for y in questions
-    ])
+        if y and all(x.get("response_tokens_only") is not None for x in y)
+    ] or [0])  # Default to [0] if list is empty
 
-    average_entropy = np.average([x[0]["entropy"] for x in questions])
+    # Average entropy with None check
+    average_entropy = np.average([
+        x[0]["entropy"] for x in questions 
+        if x and x[0].get("entropy") is not None
+    ] or [0])  # Default to [0] if list is empty
     
     return {
         "average_resp_length": average_resp_length,
@@ -97,14 +125,31 @@ def generate_wandb_logs(questions):
         "average_entropy": average_entropy,
     }
 
+def setup_model(model_name, index):
+    """Helper function to load model on a specific device"""
+    return AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        torch_dtype=torch.bfloat16
+    ).to(f"cuda:{index}")
+
 def main():
 
     args = get_args()
-
     wandb.init(project="iterative-sft", config=args)
+
+    num_gpus = torch.cuda.device_count()
+    print("--------------------------------")
+    print(f"Using {num_gpus} GPUs")
+    print("--------------------------------")
+
     # Load the model and tokenizer
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16).to("cuda")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
+    model_name = args.model_name
+    models = [
+        setup_model(model_name, i)
+        for i in range(num_gpus)
+    ]   
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 
     data = gsm8k_processed()
@@ -124,7 +169,7 @@ def main():
     # to each chunk of 100 questions, then chose the best
     # of each of K, and train on that.
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = AdamW(models[0].parameters(), lr=args.learning_rate)
     lr_scheduler = get_scheduler(
         name="linear",
         optimizer=optimizer,
@@ -132,7 +177,7 @@ def main():
         num_training_steps=training_args.max_steps,
     )
     trainer = IterativeSFTTrainer(
-        model,
+        models[0],
         args=training_args,
         processing_class=tokenizer,
         optimizers=(optimizer, lr_scheduler),
@@ -142,15 +187,36 @@ def main():
 
     for i in range(args.num_iter):
 
+        task_queue = Queue()
+        results = [None] * args.num_questions_per_iter
+
         print(f"Iteration {i}")
-        questions = []
-        for j in range(args.num_questions_per_iter):
-            print(f"Generating for question {step}")
-            step += 1
+        threads = []
+        for gpu_id in range(num_gpus):
+            thread = threading.Thread(
+                target=gpu_worker,
+                args=(models[gpu_id], tokenizer, data, task_queue, results, args, gpu_id)
+            )
+            thread.start()
+            threads.append(thread)
+        
+        # Add tasks to queue
+        for q_idx in range(args.num_questions_per_iter):
             if step >= len(data):
                 step = 0
-            responses = generate_responses(model, tokenizer, data, step, args)
-            questions.append(responses)
+            task_queue.put((step, q_idx))
+            step += 1
+        
+        # Add poison pills to stop workers
+        for _ in range(num_gpus):
+            task_queue.put(None)
+            
+        # Wait for all tasks to complete
+        for thread in threads:
+            thread.join()
+        
+        # Convert results to questions list
+        questions = [r for r in results if r is not None]
 
         wandb.log({
             "iteration": i,
@@ -182,9 +248,12 @@ def main():
             labels=[ii[1:] for ii in input_ids],
         )
         
-        # save weights to output_dir every 100 steps
+        # Sync weights to other models
+        for gpu_id in range(1, num_gpus):
+            models[gpu_id].load_state_dict(models[0].state_dict())
+        
         if i % 100 == 0:
-            model.save_pretrained(args.output_dir)
+            models[0].save_pretrained(args.output_dir)
 
 
 
